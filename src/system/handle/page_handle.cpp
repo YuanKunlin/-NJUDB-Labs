@@ -171,19 +171,74 @@ PAXPageHandle::~PAXPageHandle() = default;
 // | field_m_1 | field_m_2 | ... | field_m_n |
 void PAXPageHandle::WriteSlot(size_t slot_id, const char *null_map, const char *data, bool update)
 {
-  NJUDB_STUDENT_TODO(l1, f2);
+  NJUDB_ASSERT(slot_id < tab_hdr_->rec_per_page_, "slot_id out of range");
+  NJUDB_ASSERT(BitMap::GetBit(bitmap_, slot_id) == update, fmt::format("update: {}", update));
+
+  char *header = GetRecordHeader(slot_id);
+  if (!update) {
+    // new tuple: the header (and the nullmap living in it) starts from scratch
+    RecordHeader::Initialize(header, INVALID_TXN_ID, tab_hdr_->field_num_);
+  }
+  memcpy(RecordHeader::GetNullMapPtr(header), null_map, tab_hdr_->nullmap_size_);
+
+  // each field goes to its own column at [column offset + slot * field size]
+  for (size_t i = 0; i < schema_->GetFieldCount(); ++i) {
+    const auto &field = schema_->GetFieldAt(i).field_;
+    memcpy(slots_mem_ + offsets_[i] + slot_id * field.field_size_,
+        data + schema_->GetFieldOffset(i),
+        field.field_size_);
+  }
 }
 
 void PAXPageHandle::ReadSlot(size_t slot_id, char *null_map, char *data)
 {
-  NJUDB_STUDENT_TODO(l1, f2);
+  NJUDB_ASSERT(slot_id < tab_hdr_->rec_per_page_, "slot_id out of range");
+  NJUDB_ASSERT(BitMap::GetBit(bitmap_, slot_id) == true, "slot is empty");
+
+  const char *header = GetRecordHeader(slot_id);
+  memcpy(null_map, RecordHeader::GetNullMapPtr(header), tab_hdr_->nullmap_size_);
+
+  // gather the columns back into the packed row format the caller expects
+  for (size_t i = 0; i < schema_->GetFieldCount(); ++i) {
+    const auto &field = schema_->GetFieldAt(i).field_;
+    memcpy(data + schema_->GetFieldOffset(i),
+        slots_mem_ + offsets_[i] + slot_id * field.field_size_,
+        field.field_size_);
+  }
 }
 
 auto PAXPageHandle::ReadChunk(const RecordSchema *chunk_schema) -> ChunkUptr
 {
   std::vector<ArrayValueSptr> col_arrs;
   col_arrs.reserve(chunk_schema->GetFieldCount());
-  NJUDB_STUDENT_TODO(l1, f2);
+
+  // map every requested field back to its position in the table schema
+  std::vector<size_t> field_index;
+  field_index.reserve(chunk_schema->GetFieldCount());
+  for (size_t i = 0; i < chunk_schema->GetFieldCount(); ++i) {
+    const auto &field = chunk_schema->GetFieldAt(i).field_;
+    field_index.push_back(schema_->GetFieldIndex(field.table_id_, field.field_name_));
+  }
+
+  // a chunk contains one array per requested column, holding the value of every
+  // occupied slot in slot order
+  for (size_t i = 0; i < chunk_schema->GetFieldCount(); ++i) {
+    const auto &field      = schema_->GetFieldAt(field_index[i]).field_;
+    auto        array      = ValueFactory::CreateArrayValue();
+    for (size_t slot_id = 0; slot_id < tab_hdr_->rec_per_page_; ++slot_id) {
+      if (!BitMap::GetBit(bitmap_, slot_id)) {
+        continue;
+      }
+      const char *null_map = RecordHeader::GetNullMapPtr(GetRecordHeader(slot_id));
+      if (BitMap::GetBit(null_map, field_index[i])) {
+        array->Append(ValueFactory::CreateNullValue(field.field_type_));
+      } else {
+        array->Append(ValueFactory::CreateValue(
+            field.field_type_, slots_mem_ + offsets_[field_index[i]] + slot_id * field.field_size_, field.field_size_));
+      }
+    }
+    col_arrs.emplace_back(std::move(array));
+  }
   return std::make_unique<Chunk>(chunk_schema, std::move(col_arrs));
 }
 

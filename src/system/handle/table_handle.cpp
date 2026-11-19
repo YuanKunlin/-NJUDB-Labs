@@ -44,6 +44,22 @@ auto FindFreeSlot(PageHandle *pg_hdl, const TableHeader &tab_hdr) -> size_t
   return slot_id;
 }
 
+auto BuildTupleImage(const TableHeader &tab_hdr, const char *null_map, const char *data) -> std::vector<char>
+{
+  std::vector<char> image(tab_hdr.nullmap_size_ + tab_hdr.rec_size_);
+  std::memcpy(image.data(), null_map, tab_hdr.nullmap_size_);
+  std::memcpy(image.data() + tab_hdr.nullmap_size_, data, tab_hdr.rec_size_);
+  return image;
+}
+
+void CheckWriteAllowed(Transaction *txn)
+{
+  if (txn != nullptr && txn->GetProtocol() == ConcurrencyProtocol::MVCC &&
+      !MVCCWriteContext::IsAuthorized(txn)) {
+    NJUDB_THROW(NJUDB_UNSUPPORTED_OP, "MVCC writes must go through the MVCC coordinator");
+  }
+}
+
 }  // namespace
 
 TableHandle::TableHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, table_id_t table_id,
@@ -55,10 +71,16 @@ TableHandle::TableHandle(DiskManager *disk_manager, BufferPoolManager *buffer_po
       schema_(std::move(schema)),
       storage_model_(storage_model)
 {
-  // set table id for table handle;
   schema_->SetTableId(table_id_);
   if (storage_model_ == PAX_MODEL) {
-    NJUDB_STUDENT_TODO(l1, f2);
+    // PAX slot memory: [tuple headers][column 0][column 1]...
+    // each column stores rec_per_page_ values contiguously
+    size_t offset = tab_hdr_.rec_per_page_ * tab_hdr_.tuple_header_size_;
+    field_offset_.reserve(schema_->GetFieldCount());
+    for (size_t i = 0; i < schema_->GetFieldCount(); ++i) {
+      field_offset_.push_back(offset);
+      offset += tab_hdr_.rec_per_page_ * schema_->GetFieldAt(i).field_.field_size_;
+    }
   }
 }
 
@@ -86,7 +108,6 @@ void TableHandle::LogPageModification(Transaction *txn, const RID &rid,
 
 auto TableHandle::GetRecord(const RID &rid, Transaction *txn) -> RecordUptr
 {
-  // No transaction: direct read without concurrency control
   if (txn == nullptr) {
     return ReadDirectFromPage(rid);
   }
@@ -95,9 +116,7 @@ auto TableHandle::GetRecord(const RID &rid, Transaction *txn) -> RecordUptr
     return ReadVersionAware(rid, txn);
   }
 
-  // 2PL protects the page read with an S lock and never consults MVCC versions.
   if (ShouldAcquireReadLock(txn)) {
-    // Table-level IS lock should already be held by the executor.
     AcquireTupleLock(txn, LockMode::SHARED, rid);
   }
 
@@ -109,7 +128,6 @@ auto TableHandle::GetRecord(const RID &rid, Transaction *txn) -> RecordUptr
     throw;
   }
 
-  // READ_COMMITTED 2PL releases its tuple S lock immediately after the read.
   ReleaseTupleLockImmediately(txn, rid);
 
   return record;
@@ -117,9 +135,6 @@ auto TableHandle::GetRecord(const RID &rid, Transaction *txn) -> RecordUptr
 
 auto TableHandle::ReadVersionAware(const RID &rid, Transaction *txn) -> RecordUptr
 {
-  // Runtime MVCC visibility is defined exclusively by the undo-version chain.
-  // Tuple-header xmin/xmax fields are retained only as recovery/diagnostic
-  // metadata and must never be used as a fallback visibility implementation.
   if (version_manager_ == nullptr) {
     NJUDB_THROW(NJUDB_UNSUPPORTED_OP, "MVCC table reads require a VersionManager");
   }
@@ -140,12 +155,20 @@ auto TableHandle::ReadVersionAware(const RID &rid, Transaction *txn) -> RecordUp
 
 auto TableHandle::ReadDirectFromPage(const RID &rid) -> RecordUptr
 {
-  NJUDB_STUDENT_TODO(l1, t3);
+  auto pg_hdl = FetchPageHandle(rid.PageID());
+  if (!BitMap::GetBit(pg_hdl->GetBitmap(), rid.SlotID())) {
+    buffer_pool_manager_->UnpinPage(table_id_, rid.PageID(), false);
+    NJUDB_THROW(NJUDB_RECORD_MISS, fmt::format("Record {} does not exist", rid.ToString()));
+  }
+
+  std::vector<char> null_map(tab_hdr_.nullmap_size_);
+  std::vector<char> data(tab_hdr_.rec_size_);
+  pg_hdl->ReadSlot(rid.SlotID(), null_map.data(), data.data());
+
+  buffer_pool_manager_->UnpinPage(table_id_, rid.PageID(), false);
+  return std::make_unique<Record>(schema_.get(), null_map.data(), data.data(), rid);
 }
 
-//===--------------------------------------------------------------------===//
-// Helper Methods for Lock Acquisition (2PL)
-//===--------------------------------------------------------------------===//
 
 auto TableHandle::AcquireTableLock(Transaction *txn, LockMode lock_mode) -> bool
 {
@@ -192,7 +215,10 @@ void TableHandle::ReleaseTupleLockImmediately(Transaction *txn, const RID &rid)
 
 auto TableHandle::GetChunk(page_id_t pid, const RecordSchema *chunk_schema) -> ChunkUptr
 {
-  NJUDB_STUDENT_TODO(l1, f2);
+  auto pg_hdl = FetchPageHandle(pid);
+  auto chunk  = pg_hdl->ReadChunk(chunk_schema);
+  buffer_pool_manager_->UnpinPage(table_id_, pid, false);
+  return chunk;
 }
 
 auto TableHandle::InsertRecord(const Record &record, Transaction *txn) -> RID
@@ -203,7 +229,44 @@ auto TableHandle::InsertRecord(const Record &record, Transaction *txn) -> RID
 auto TableHandle::InsertRecordBeforePageWrite(
     const Record &record, Transaction *txn, const std::function<void(const RID &)> &before_page_write) -> RID
 {
-  NJUDB_STUDENT_TODO(l1, t3);
+  CheckWriteAllowed(txn);
+
+  auto pg_hdl  = CreatePageHandle();
+  auto page_id = pg_hdl->GetPage()->GetPageId();
+  auto slot_id = FindFreeSlot(pg_hdl.get(), tab_hdr_);
+  NJUDB_ASSERT(slot_id < tab_hdr_.rec_per_page_, "page handle without free slot");
+  const RID rid(page_id, static_cast<slot_id_t>(slot_id));
+
+  if (txn != nullptr) {
+    AcquireTupleLock(txn, LockMode::EXCLUSIVE, rid);
+  }
+  // the caller (e.g. the MVCC coordinator) may need to publish the RID first
+  if (before_page_write) {
+    before_page_write(rid);
+  }
+
+  pg_hdl->WriteSlot(slot_id, record.GetNullMap(), record.GetData(), false);
+  BitMap::SetBit(pg_hdl->GetBitmap(), slot_id, true);
+  auto *page = pg_hdl->GetPage();
+  page->SetRecordNum(page->GetRecordNum() + 1);
+  ++tab_hdr_.rec_num_;
+
+  if (page->GetRecordNum() == tab_hdr_.rec_per_page_) {
+    RemovePageFromFreeList(page_id, page);
+  }
+
+  lsn_t lsn = INVALID_LSN;
+  if (txn != nullptr && log_manager_ != nullptr) {
+    const auto image = BuildTupleImage(tab_hdr_, record.GetNullMap(), record.GetData());
+    LogPageModification(txn, rid, nullptr, image.data(), static_cast<uint32_t>(image.size()));
+    lsn = txn->GetPrevLSN();
+  }
+  if (txn != nullptr) {
+    txn->AppendWriteRecord(TableWriteRecord(table_id_, rid, nullptr, lsn));
+  }
+
+  buffer_pool_manager_->UnpinPage(table_id_, page_id, true);
+  return rid;
 }
 
 void TableHandle::InsertRecord(const RID &rid, const Record &record, Transaction *txn)
@@ -211,17 +274,119 @@ void TableHandle::InsertRecord(const RID &rid, const Record &record, Transaction
   if (rid.PageID() == INVALID_PAGE_ID) {
     NJUDB_THROW(NJUDB_PAGE_MISS, fmt::format("Page: {}", rid.PageID()));
   }
-  NJUDB_STUDENT_TODO(l1, t3);
+  CheckWriteAllowed(txn);
+
+  auto pg_hdl = FetchPageHandle(rid.PageID());
+  if (BitMap::GetBit(pg_hdl->GetBitmap(), rid.SlotID())) {
+    buffer_pool_manager_->UnpinPage(table_id_, rid.PageID(), false);
+    NJUDB_THROW(NJUDB_RECORD_EXISTS, fmt::format("Record {} already exists", rid.ToString()));
+  }
+
+  if (txn != nullptr) {
+    AcquireTupleLock(txn, LockMode::EXCLUSIVE, rid);
+  }
+
+  pg_hdl->WriteSlot(rid.SlotID(), record.GetNullMap(), record.GetData(), false);
+  BitMap::SetBit(pg_hdl->GetBitmap(), rid.SlotID(), true);
+  auto *page = pg_hdl->GetPage();
+  page->SetRecordNum(page->GetRecordNum() + 1);
+  ++tab_hdr_.rec_num_;
+  if (page->GetRecordNum() == tab_hdr_.rec_per_page_) {
+    RemovePageFromFreeList(rid.PageID(), page);
+  }
+
+  lsn_t lsn = INVALID_LSN;
+  if (txn != nullptr && log_manager_ != nullptr) {
+    const auto image = BuildTupleImage(tab_hdr_, record.GetNullMap(), record.GetData());
+    LogPageModification(txn, rid, nullptr, image.data(), static_cast<uint32_t>(image.size()));
+    lsn = txn->GetPrevLSN();
+  }
+  if (txn != nullptr) {
+    txn->AppendWriteRecord(TableWriteRecord(table_id_, rid, nullptr, lsn));
+  }
+
+  buffer_pool_manager_->UnpinPage(table_id_, rid.PageID(), true);
 }
 
 void TableHandle::DeleteRecord(const RID &rid, Transaction *txn)
 {
-  NJUDB_STUDENT_TODO(l1, t3);
+  CheckWriteAllowed(txn);
+
+  auto pg_hdl = FetchPageHandle(rid.PageID());
+  if (!BitMap::GetBit(pg_hdl->GetBitmap(), rid.SlotID())) {
+    buffer_pool_manager_->UnpinPage(table_id_, rid.PageID(), false);
+    NJUDB_THROW(NJUDB_RECORD_MISS, fmt::format("Record {} does not exist", rid.ToString()));
+  }
+
+  if (txn != nullptr) {
+    AcquireTupleLock(txn, LockMode::EXCLUSIVE, rid);
+  }
+
+  std::vector<char> image;
+  if (txn != nullptr) {
+    image.resize(tab_hdr_.nullmap_size_ + tab_hdr_.rec_size_);
+    pg_hdl->ReadSlot(rid.SlotID(), image.data(), image.data() + tab_hdr_.nullmap_size_);
+  }
+
+  auto *page    = pg_hdl->GetPage();
+  bool  was_full = page->GetRecordNum() == tab_hdr_.rec_per_page_;
+  BitMap::SetBit(pg_hdl->GetBitmap(), rid.SlotID(), false);
+  page->SetRecordNum(page->GetRecordNum() - 1);
+  --tab_hdr_.rec_num_;
+  // a page that was full now has room again, so it must rejoin the free list
+  if (was_full) {
+    AddPageToFreeListIfMissing(rid.PageID(), page);
+  }
+
+  lsn_t lsn = INVALID_LSN;
+  if (txn != nullptr && log_manager_ != nullptr) {
+    LogPageModification(txn, rid, image.data(), nullptr, static_cast<uint32_t>(image.size()));
+    lsn = txn->GetPrevLSN();
+  }
+  if (txn != nullptr) {
+    auto old_record =
+        std::make_unique<Record>(schema_.get(), image.data(), image.data() + tab_hdr_.nullmap_size_, rid);
+    txn->AppendWriteRecord(TableWriteRecord(table_id_, rid, std::move(old_record), lsn));
+  }
+
+  buffer_pool_manager_->UnpinPage(table_id_, rid.PageID(), true);
 }
 
 void TableHandle::UpdateRecord(const RID &rid, const Record &record, Transaction *txn)
 {
-  NJUDB_STUDENT_TODO(l1, t3);
+  CheckWriteAllowed(txn);
+
+  auto pg_hdl = FetchPageHandle(rid.PageID());
+  if (!BitMap::GetBit(pg_hdl->GetBitmap(), rid.SlotID())) {
+    buffer_pool_manager_->UnpinPage(table_id_, rid.PageID(), false);
+    NJUDB_THROW(NJUDB_RECORD_MISS, fmt::format("Record {} does not exist", rid.ToString()));
+  }
+
+  if (txn != nullptr) {
+    AcquireTupleLock(txn, LockMode::EXCLUSIVE, rid);
+  }
+
+  std::vector<char> old_image;
+  if (txn != nullptr) {
+    old_image.resize(tab_hdr_.nullmap_size_ + tab_hdr_.rec_size_);
+    pg_hdl->ReadSlot(rid.SlotID(), old_image.data(), old_image.data() + tab_hdr_.nullmap_size_);
+  }
+
+  pg_hdl->WriteSlot(rid.SlotID(), record.GetNullMap(), record.GetData(), true);
+
+  lsn_t lsn = INVALID_LSN;
+  if (txn != nullptr && log_manager_ != nullptr) {
+    const auto new_image = BuildTupleImage(tab_hdr_, record.GetNullMap(), record.GetData());
+    LogPageModification(txn, rid, old_image.data(), new_image.data(), static_cast<uint32_t>(new_image.size()));
+    lsn = txn->GetPrevLSN();
+  }
+  if (txn != nullptr) {
+    auto old_record =
+        std::make_unique<Record>(schema_.get(), old_image.data(), old_image.data() + tab_hdr_.nullmap_size_, rid);
+    txn->AppendWriteRecord(TableWriteRecord(table_id_, rid, std::move(old_record), lsn));
+  }
+
+  buffer_pool_manager_->UnpinPage(table_id_, rid.PageID(), true);
 }
 
 auto TableHandle::FetchPageHandle(page_id_t page_id) -> PageHandleUptr
@@ -241,8 +406,6 @@ auto TableHandle::CreatePageHandle() -> PageHandleUptr
       return pg_hdl;
     }
 
-    // The free-list head is stale: it points to a full page. Repair the list
-    // and continue instead of failing an otherwise valid insert.
     tab_hdr_.first_free_page_ = page->GetNextFreePageId();
     page->SetNextFreePageId(INVALID_PAGE_ID);
     buffer_pool_manager_->UnpinPage(table_id_, page_id, true);
@@ -401,10 +564,6 @@ auto TableHandle::HasField(const std::string &field_name) const -> bool
   return schema_->HasField(table_id_, field_name);
 }
 
-//===--------------------------------------------------------------------===//
-// Recovery Support (Lab06 Phase 4)
-//===--------------------------------------------------------------------===//
-
 auto TableHandle::ApplyRecoveryOperation(page_id_t page_id, uint32_t slot_id,
                                          DataOperationType operation,
                                          const std::vector<char> &image, lsn_t lsn,
@@ -418,10 +577,6 @@ auto TableHandle::ApplyRecoveryOperation(page_id_t page_id, uint32_t slot_id,
   bool exists = BitMap::GetBit(pg_handle->GetBitmap(), slot_id);
   auto expected_length = tab_hdr_.nullmap_size_ + tab_hdr_.rec_size_;
 
-  // MVCC runtime deletes are logical: the slot can remain occupied while the
-  // pageLSN already reflects the delete log. Recovery may explicitly request
-  // physicalizing such a visible slot. 2PL DELETE and CLR DELETE keep the
-  // normal pageLSN idempotence rule to avoid deleting later RID reuse.
   if (page->GetLsn() >= lsn && !(force_delete_if_visible && operation == DataOperationType::DELETE && exists)) {
     buffer_pool_manager_->UnpinPage(table_id_, page_id, false);
     return false;
