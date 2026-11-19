@@ -47,12 +47,39 @@ BufferPoolManager::BufferPoolManager(DiskManager *disk_manager, njudb::LogManage
 
 auto BufferPoolManager::FetchPage(file_id_t fid, page_id_t pid) -> Page *
 {
-  NJUDB_STUDENT_TODO(l1, t2);
+  std::lock_guard<std::mutex> latch_guard(latch_);
+  const fid_pid_t             key{fid, pid};
+  const auto                  lookup_it = page_frame_lookup_.find(key);
+  if (lookup_it != page_frame_lookup_.end()) {
+    auto &frame = frames_[lookup_it->second];
+    frame.Pin();
+    replacer_->Pin(lookup_it->second);
+    return frame.GetPage();
+  }
+  const frame_id_t frame_id = GetAvailableFrame();
+  UpdateFrame(frame_id, fid, pid);
+  return frames_[frame_id].GetPage();
 }
 
 auto BufferPoolManager::UnpinPage(file_id_t fid, page_id_t pid, bool is_dirty) -> bool
 {
-  NJUDB_STUDENT_TODO(l1, t2);
+  std::lock_guard<std::mutex> latch_guard(latch_);
+  const auto                  lookup_it = page_frame_lookup_.find({fid, pid});
+  if (lookup_it == page_frame_lookup_.end()) {
+    return false;
+  }
+  auto &frame = frames_[lookup_it->second];
+  if (!frame.InUse()) {
+    return false;
+  }
+  if (is_dirty) {
+    frame.SetDirty(true);
+  }
+  frame.Unpin();
+  if (!frame.InUse()) {
+    replacer_->Unpin(lookup_it->second);
+  }
+  return true;
 }
 
 auto BufferPoolManager::GetDirtyPages() -> std::unordered_map<std::pair<std::string, page_id_t>, lsn_t, FilePageHash>
@@ -64,9 +91,6 @@ auto BufferPoolManager::GetDirtyPages() -> std::unordered_map<std::pair<std::str
     auto &frame = frames_[frame_id];
     if (frame.IsDirty() && IsWALManagedPage(fid_pid.fid, fid_pid.pid) &&
         frame.GetRecLSN() != INVALID_LSN) {
-      // CRITICAL FIX: Store (filename, page_id) instead of (file_id, page_id)
-      // because file IDs are transient and change across system restarts.
-      // Filenames are persistent and can be resolved to current file_id during recovery.
       std::string filename = disk_manager_->GetFileName(fid_pid.fid);
       auto dpt_key = std::make_pair(filename, fid_pid.pid);
       dirty_pages[dpt_key] = frame.GetRecLSN();
@@ -78,22 +102,78 @@ auto BufferPoolManager::GetDirtyPages() -> std::unordered_map<std::pair<std::str
 
 auto BufferPoolManager::DeletePage(file_id_t fid, page_id_t pid) -> bool
 {
-  NJUDB_STUDENT_TODO(l1, t2);
+  std::lock_guard<std::mutex> latch_guard(latch_);
+  const auto                  lookup_it = page_frame_lookup_.find({fid, pid});
+  if (lookup_it == page_frame_lookup_.end()) {
+    return true;
+  }
+  const frame_id_t frame_id = lookup_it->second;
+  auto            &frame    = frames_[frame_id];
+  if (frame.InUse()) {
+    return false;
+  }
+  if (frame.IsDirty()) {
+    FlushFrameLocked(frame_id);
+  }
+  page_frame_lookup_.erase(lookup_it);
+  // drop the frame from the replacer so the next page loaded here does not
+  // inherit the access history of the deleted one
+  replacer_->Remove(frame_id);
+  frame.Reset();
+  free_list_.push_back(frame_id);
+  return true;
 }
 
 auto BufferPoolManager::DeleteAllPages(file_id_t fid) -> bool
 {
-  NJUDB_STUDENT_TODO(l1, t2);
+  std::lock_guard<std::mutex> latch_guard(latch_);
+  std::vector<frame_id_t>     frame_ids;
+  for (const auto &[key, frame_id] : page_frame_lookup_) {
+    if (key.fid == fid) {
+      if (frames_[frame_id].InUse()) {
+        return false;
+      }
+      frame_ids.push_back(frame_id);
+    }
+  }
+  for (const frame_id_t frame_id : frame_ids) {
+    auto &frame = frames_[frame_id];
+    if (frame.IsDirty()) {
+      FlushFrameLocked(frame_id);
+    }
+    page_frame_lookup_.erase({frame.GetPage()->GetFileId(), frame.GetPage()->GetPageId()});
+    replacer_->Remove(frame_id);
+    frame.Reset();
+    free_list_.push_back(frame_id);
+  }
+  return true;
 }
 
 auto BufferPoolManager::FlushPage(file_id_t fid, page_id_t pid) -> bool
 {
-  NJUDB_STUDENT_TODO(l1, t2);
+  std::lock_guard<std::mutex> latch_guard(latch_);
+  const auto                  lookup_it = page_frame_lookup_.find({fid, pid});
+  if (lookup_it == page_frame_lookup_.end()) {
+    return false;
+  }
+  // keep the same rule as FlushAllPages: a page that is still pinned may be
+  // under modification, so it must not be written out here
+  return FlushFrameLocked(lookup_it->second);
 }
 
 auto BufferPoolManager::FlushAllPages(file_id_t fid) -> bool
 {
-  NJUDB_STUDENT_TODO(l1, t2);
+  std::lock_guard<std::mutex> latch_guard(latch_);
+  bool                        all_flushed = true;
+  for (const auto &[key, frame_id] : page_frame_lookup_) {
+    if (key.fid != fid) {
+      continue;
+    }
+    if (!FlushFrameLocked(frame_id)) {
+      all_flushed = false;
+    }
+  }
+  return all_flushed;
 }
 
 auto BufferPoolManager::FlushAllPages() -> bool
@@ -110,12 +190,38 @@ auto BufferPoolManager::FlushAllPages() -> bool
 
 auto BufferPoolManager::GetAvailableFrame() -> frame_id_t
 {
-  NJUDB_STUDENT_TODO(l1, t2);
+  if (!free_list_.empty()) {
+    const frame_id_t frame_id = free_list_.front();
+    free_list_.pop_front();
+    return frame_id;
+  }
+  frame_id_t frame_id = INVALID_FRAME_ID;
+  if (!replacer_->Victim(&frame_id)) {
+    NJUDB_THROW(NJUDB_NO_FREE_FRAME, "no frame can be evicted");
+  }
+  return frame_id;
 }
 
 void BufferPoolManager::UpdateFrame(frame_id_t frame_id, file_id_t fid, page_id_t pid)
 {
-  NJUDB_STUDENT_TODO(l1, t2);
+  auto &frame = frames_[frame_id];
+  auto *page  = frame.GetPage();
+  // the frame is either free (Reset) or a victim, both have pin_count == 0;
+  // a pinned frame must never be overwritten
+  NJUDB_ASSERT(!frame.InUse(), "UpdateFrame on a pinned frame");
+  const auto old_fid = page->GetFileId();
+  const auto old_pid = page->GetPageId();
+  if (frame.IsDirty()) {
+    FlushFrameLocked(frame_id);
+  }
+  if (old_fid != INVALID_FILE_ID) {
+    page_frame_lookup_.erase({old_fid, old_pid});
+  }
+  page->SetFilePageId(fid, pid);
+  disk_manager_->ReadPage(fid, pid, page->GetData());
+  frame.Pin();
+  replacer_->Pin(frame_id);
+  page_frame_lookup_[{fid, pid}] = frame_id;
 }
 
 auto BufferPoolManager::FlushFrameLocked(frame_id_t frame_id) -> bool
