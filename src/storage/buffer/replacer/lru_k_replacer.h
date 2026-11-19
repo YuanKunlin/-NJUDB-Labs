@@ -21,6 +21,7 @@
 
 #ifndef NJUDB_LRU_K_REPLACER_H
 #define NJUDB_LRU_K_REPLACER_H
+#include <limits>
 #include <list>
 #include <mutex>
 #include <unordered_map>
@@ -43,6 +44,8 @@ public:
 
   void Unpin(frame_id_t frame_id) override;
 
+  void Remove(frame_id_t frame_id) override;
+
   auto Size() -> size_t override;
 
 private:
@@ -53,7 +56,14 @@ private:
 
     explicit LRUKNode(frame_id_t fid, size_t k) : fid_(fid), k(k), is_evictable_(false) {}
 
-    void AddHistory(timestamp_t ts) { NJUDB_STUDENT_TODO(l1, f1); }
+    void AddHistory(timestamp_t ts)
+    {
+      history_.push_back(ts);
+      // only the last k accesses matter for the backward k distance
+      if (history_.size() > k) {
+        history_.pop_front();
+      }
+    }
 
     /**
      * Get the distance between the current timestamp and the k-th timestamp in the history,
@@ -61,14 +71,29 @@ private:
      * @param cur_ts
      * @return
      */
-    auto GetBackwardKDistance(timestamp_t cur_ts) -> unsigned long long
+    auto GetBackwardKDistance(timestamp_t cur_ts) const -> unsigned long long
     {
-      NJUDB_STUDENT_TODO(l1, f1);
+      // fewer than k accesses: the frame has no k-th backward reference, so it is
+      // treated as infinitely far away. unsigned long long is used so that this
+      // "infinity" is representable and always larger than any real distance.
+      if (history_.size() < k) {
+        return std::numeric_limits<unsigned long long>::max();
+      }
+      return cur_ts - history_.front();
     }
 
-    [[nodiscard]] auto IsEvictable() const -> bool { NJUDB_STUDENT_TODO(l1, f1); }
+    /**
+     * Timestamp of the first access. Only meaningful while the history is not full,
+     * where it is used to break ties between frames whose distance is infinite.
+     */
+    [[nodiscard]] auto GetFirstAccessTimestamp() const -> timestamp_t
+    {
+      return history_.empty() ? 0 : history_.front();
+    }
 
-    auto SetEvictable(bool set_evictable) -> void { NJUDB_STUDENT_TODO(l1, f1); }
+    [[nodiscard]] auto IsEvictable() const -> bool { return is_evictable_; }
+
+    auto SetEvictable(bool set_evictable) -> void { is_evictable_ = set_evictable; }
 
   private:
     std::list<timestamp_t> history_;

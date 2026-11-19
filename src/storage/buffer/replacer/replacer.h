@@ -54,6 +54,14 @@ public:
    */
   virtual void Unpin(frame_id_t frame_id) = 0;
 
+  /**
+   * Forgets a frame entirely, dropping its access history and its evictable state.
+   * Used when a frame is taken out of service (page deleted, frame recycled), so
+   * that the next page loaded into it does not inherit the previous page's history.
+   * @param frame_id the id of the frame to forget
+   */
+  virtual void Remove(frame_id_t frame_id) = 0;
+
   /** @return the number of elements in the replacer that can be victimized */
   virtual auto Size() -> size_t = 0;
 };

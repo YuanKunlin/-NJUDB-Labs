@@ -72,6 +72,12 @@ public:
   void Unpin(frame_id_t frame_id) override;
 
   /**
+   * Drop the frame from the replacer, including its recency information.
+   * @param frame_id
+   */
+  void Remove(frame_id_t frame_id) override;
+
+  /**
    * Get the number of elements in the replacer that can be victimized.
    * 1. grant the latch
    * 2. return the size of the LRU list
