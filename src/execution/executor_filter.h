@@ -40,6 +40,13 @@ public:
   [[nodiscard]] auto GetOutSchema() const -> const RecordSchema * override;
 
 private:
+  /**
+   * Pull rows from the child until one satisfies the predicate.
+   * Keeps the child positioned on the row that was accepted; sets record_ to
+   * nullptr once the child is exhausted.
+   */
+  void FindNextMatch();
+
   AbstractExecutorUptr                child_;
   std::function<bool(const Record &)> filter_;
 };

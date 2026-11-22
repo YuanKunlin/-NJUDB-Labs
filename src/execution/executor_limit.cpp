@@ -26,11 +26,31 @@ LimitExecutor::LimitExecutor(AbstractExecutorUptr child, int limit)
     : AbstractExecutor(Basic), child_(std::move(child)), limit_(limit), count_(0)
 {}
 
-void LimitExecutor::Init() { NJUDB_STUDENT_TODO(l2, t1); }
+void LimitExecutor::Init()
+{
+  child_->Init();
+  count_  = 0;
+  record_ = nullptr;
+  if (limit_ > 0 && !child_->IsEnd()) {
+    record_ = child_->GetRecord();
+  }
+}
 
-void LimitExecutor::Next() { NJUDB_STUDENT_TODO(l2, t1); }
+void LimitExecutor::Next()
+{
+  if (IsEnd()) {
+    return;
+  }
+  ++count_;
+  if (count_ >= limit_) {
+    record_ = nullptr;
+    return;
+  }
+  child_->Next();
+  record_ = child_->IsEnd() ? nullptr : child_->GetRecord();
+}
 
-[[nodiscard]] auto LimitExecutor::IsEnd() const -> bool { NJUDB_STUDENT_TODO(l2, t1); }
+[[nodiscard]] auto LimitExecutor::IsEnd() const -> bool { return record_ == nullptr; }
 
 [[nodiscard]] auto LimitExecutor::GetOutSchema() const -> const RecordSchema * { return child_->GetOutSchema(); }
 }  // namespace njudb

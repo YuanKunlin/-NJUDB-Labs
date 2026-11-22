@@ -32,10 +32,17 @@ SeqScanExecutor::SeqScanExecutor(TableHandle *tab, Context *context)
 void SeqScanExecutor::Init()
 {
   rid_ = tab_->GetFirstRID();
-  NJUDB_STUDENT_TODO(l2, t1);
+  record_ = nullptr;
+  LoadCurrentVisibleRecord();
 }
 
-void SeqScanExecutor::Next() { NJUDB_STUDENT_TODO(l2, t1); }
+void SeqScanExecutor::Next() {
+  if (IsEnd()) {
+    return;
+  }
+  rid_ = tab_->GetNextRID(rid_);
+  LoadCurrentVisibleRecord();
+}
 
 void SeqScanExecutor::LoadCurrentVisibleRecord()
 {
@@ -54,7 +61,7 @@ void SeqScanExecutor::LoadCurrentVisibleRecord()
   record_ = nullptr;
 }
 
-auto SeqScanExecutor::IsEnd() const -> bool { NJUDB_STUDENT_TODO(l2, t1); }
+auto SeqScanExecutor::IsEnd() const -> bool { return rid_ == INVALID_RID;}
 
 auto SeqScanExecutor::GetOutSchema() const -> const RecordSchema * { return &tab_->GetSchema(); }
 }  // namespace njudb

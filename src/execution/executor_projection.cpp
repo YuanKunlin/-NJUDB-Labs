@@ -29,12 +29,28 @@ ProjectionExecutor::ProjectionExecutor(AbstractExecutorUptr child, RecordSchemaU
   out_schema_ = std::move(proj_schema);
 }
 
-// hint: record_ = std::make_unique<Record>(out_schema_.get(), *child_record);
+void ProjectionExecutor::Init()
+{
+  child_->Init();
+  record_ = nullptr;
+  if (!child_->IsEnd()) {
+    record_ = std::make_unique<Record>(out_schema_.get(), *child_->GetRecord());
+  }
+}
 
-void ProjectionExecutor::Init() { NJUDB_STUDENT_TODO(l2, t1); }
+void ProjectionExecutor::Next()
+{
+  if (IsEnd()) {
+    return;
+  }
+  child_->Next();
+  if (child_->IsEnd()) {
+    record_ = nullptr;
+    return;
+  }
+  record_ = std::make_unique<Record>(out_schema_.get(), *child_->GetRecord());
+}
 
-void ProjectionExecutor::Next() { NJUDB_STUDENT_TODO(l2, t1); }
-
-auto ProjectionExecutor::IsEnd() const -> bool { NJUDB_STUDENT_TODO(l2, t1); }
+auto ProjectionExecutor::IsEnd() const -> bool { return record_ == nullptr; }
 
 }  // namespace njudb

@@ -26,11 +26,38 @@ namespace njudb {
 FilterExecutor::FilterExecutor(AbstractExecutorUptr child, std::function<bool(const Record &)> filter)
     : AbstractExecutor(Basic), child_(std::move(child)), filter_(std::move(filter))
 {}
-void FilterExecutor::Init() { NJUDB_STUDENT_TODO(l2, t1); }
+void FilterExecutor::Init()
+{
+  child_->Init();
+  record_ = nullptr;
+  FindNextMatch();
+}
 
-void FilterExecutor::Next() { NJUDB_STUDENT_TODO(l2, t1); }
+void FilterExecutor::Next()
+{
+  if (IsEnd()) {
+    return;
+  }
+  child_->Next();
+  FindNextMatch();
+}
 
-auto FilterExecutor::IsEnd() const -> bool { NJUDB_STUDENT_TODO(l2, t1); }
+void FilterExecutor::FindNextMatch()
+{
+  while (!child_->IsEnd()) {
+    auto record = child_->GetRecord();
+    if (filter_(*record)) {
+      record_ = std::move(record);
+      return;
+    }
+    child_->Next();
+  }
+  record_ = nullptr;
+}
+
+auto FilterExecutor::IsEnd() const -> bool { 
+    return record_ == nullptr;
+}
 
 auto FilterExecutor::GetOutSchema() const -> const RecordSchema * { return child_->GetOutSchema(); }
 }  // namespace njudb
