@@ -11,7 +11,7 @@ BUILD_DIR="${SCRIPT_DIR}/build"
 # ==================== Student configuration ====================
 # Labs listed here compile from source; every other lab uses gold libraries.
 # Examples: "05", "05 06", "all" (all source), or "" (all gold).
-SOURCE_LABS="01"
+SOURCE_LABS="01 02"
 ENABLE_LAB05_MVCC=false
 ENABLE_LAB06_WAL=false
 BUILD_TYPE="Debug"
