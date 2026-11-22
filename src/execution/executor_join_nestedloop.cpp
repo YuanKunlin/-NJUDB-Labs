@@ -65,11 +65,56 @@ void NestedLoopJoinExecutor::NextInnerJoin()
 
 auto NestedLoopJoinExecutor::IsEndInnerJoin() const -> bool { return record_ == nullptr; }
 
-/// outer join
-void NestedLoopJoinExecutor::InitOuterJoin() { NJUDB_STUDENT_TODO(l3, t2); }
+/// 外连接（本题只要求左外连接）
+void NestedLoopJoinExecutor::InitOuterJoin()
+{
+  left_->Init();
+  right_->Init();
+  left_rec_      = nullptr;
+  record_        = nullptr;
+  need_gen_null_ = true;
+  if (left_->IsEnd()) {
+    return;  // 左表为空，没有可输出的记录
+  }
+  // 缓存当前左记录，并把输出定位到第一条结果
+  left_rec_ = left_->GetRecord();
+  NextOuterJoin();
+}
 
-void NestedLoopJoinExecutor::NextOuterJoin() { NJUDB_STUDENT_TODO(l3, t2); }
+void NestedLoopJoinExecutor::NextOuterJoin()
+{
+  while (!left_->IsEnd()) {
+    while (!right_->IsEnd()) {
+      auto joined = std::make_unique<Record>(out_schema_.get(), *left_rec_, *right_->GetRecord());
+      right_->Next();
+      if (ConditionExpr::Eval(conditions_, *joined)) {
+        need_gen_null_ = false;  // 当前左行已有匹配，不再需要补 NULL 行
+        record_        = std::move(joined);
+        return;
+      }
+    }
+    // 右表扫完：当前左行从未匹配时，输出一条右表全 NULL 的扩展行
+    bool       gen_null_row = need_gen_null_;
+    RecordUptr null_row;
+    if (gen_null_row) {
+      Record null_right(right_->GetOutSchema());  // 所有字段为 NULL 的右表记录
+      null_row = std::make_unique<Record>(out_schema_.get(), *left_rec_, null_right);
+    }
+    // 返回前先推进到下一行左记录，避免同一条左行被重复输出
+    left_->Next();
+    need_gen_null_ = true;
+    if (!left_->IsEnd()) {
+      left_rec_ = left_->GetRecord();
+      right_->Init();
+    }
+    if (gen_null_row) {
+      record_ = std::move(null_row);
+      return;
+    }
+  }
+  record_ = nullptr;
+}
 
-auto NestedLoopJoinExecutor::IsEndOuterJoin() const -> bool { return NJUDB_STUDENT_TODO(l3, t2); }
+auto NestedLoopJoinExecutor::IsEndOuterJoin() const -> bool { return record_ == nullptr; }
 
 }  // namespace njudb
