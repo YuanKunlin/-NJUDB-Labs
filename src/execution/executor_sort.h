@@ -97,7 +97,28 @@ private:
       NJUDB_ASSERT(file_handle_ != nullptr, "file_handle_ is nullptr");
       NJUDB_ASSERT(file_handle_->is_open(), "file_handle_ is not open");
 
-      NJUDB_STUDENT_TODO(l2, f1);
+      if (rec_idx_ >= max_rec_num) {
+        return false;
+      }
+      page_id_t page{};
+      slot_id_t slot{};
+      file_handle_->read(reinterpret_cast<char *>(&page), sizeof(page));
+      if (!*file_handle_) {
+        return false;  // end of this run
+      }
+      file_handle_->read(reinterpret_cast<char *>(&slot), sizeof(slot));
+
+      std::vector<char> nullmap(BITMAP_SIZE(schema_->GetFieldCount()));
+      std::vector<char> data(schema_->GetRecordLength());
+      file_handle_->read(nullmap.data(), static_cast<std::streamsize>(nullmap.size()));
+      file_handle_->read(data.data(), static_cast<std::streamsize>(data.size()));
+      if (!*file_handle_) {
+        return false;
+      }
+
+      record_ = std::make_unique<Record>(schema_, nullmap.data(), data.data(), RID(page, slot));
+      ++rec_idx_;
+      return true;
     }
 
     [[nodiscard]] auto GetRecord() const -> const RecordUptr & { return record_; }
@@ -143,6 +164,8 @@ private:
   std::string merge_result_file_;
   // we use file stream instead of disk manager to obtain faster sort speed;
   std::unique_ptr<std::ifstream> merge_result_file_handle_;
+  // path of the final merged run, kept so the destructor can remove it
+  std::string merge_result_path_;
 };
 
 }  // namespace njudb
