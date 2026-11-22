@@ -35,7 +35,25 @@ DeleteExecutor::DeleteExecutor(AbstractExecutorUptr child, TableHandle *tbl, std
 }
 void DeleteExecutor::Init()
 {
-  NJUDB_STUDENT_TODO(l2, t1);
+  is_end_ = false;
+  int  count = 0;
+  auto *txn   = context_ != nullptr ? context_->txn : nullptr;
+  child_->Init();
+  while (!child_->IsEnd()) {
+    auto record = child_->GetRecord();
+    if (txn != nullptr && txn->GetProtocol() == ConcurrencyProtocol::MVCC) {
+      MVCCWriteCoordinator::Delete(tbl_, indexes_, *record, txn, context_->version_mgr_);
+    } else {
+      for (auto *index : indexes_) {
+        index->DeleteRecord(*record);
+      }
+      tbl_->DeleteRecord(record->GetRID(), txn);
+    }
+    ++count;
+    child_->Next();
+  }
+  std::vector<ValueSptr> values{ValueFactory::CreateIntValue(count)};
+  record_ = std::make_unique<Record>(out_schema_.get(), values, INVALID_RID);
 }
 void DeleteExecutor::Next() { is_end_ = true; }
 auto DeleteExecutor::IsEnd() const -> bool { return is_end_; }

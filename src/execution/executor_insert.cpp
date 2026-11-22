@@ -42,8 +42,21 @@ void InsertExecutor::Init()
   // 1. Check existing index entries. NJUDB_STUDENT_TODO(l4, t2)
   // 2. Check duplicate keys within this batch. NJUDB_STUDENT_TODO(l4, t2)
   // 3. Apply table and index insertions atomically.
-  int count = 0;
-  NJUDB_STUDENT_TODO(l2, t1);
+  int  count = 0;
+  auto *txn   = context_ != nullptr ? context_->txn : nullptr;
+  is_end_     = false;
+  for (auto &record : inserts_) {
+    if (txn != nullptr && txn->GetProtocol() == ConcurrencyProtocol::MVCC) {
+      MVCCWriteCoordinator::Insert(tbl_, indexes_, *record, txn, context_->version_mgr_);
+    } else {
+      const RID rid = tbl_->InsertRecord(*record, txn);
+      record->SetRID(rid);
+      for (auto *index : indexes_) {
+        index->InsertRecord(*record);
+      }
+    }
+    ++count;
+  }
   std::vector<ValueSptr> values{ValueFactory::CreateIntValue(count)};
   record_ = std::make_unique<Record>(out_schema_.get(), values, INVALID_RID);
 }

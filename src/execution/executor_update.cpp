@@ -49,7 +49,40 @@ void UpdateExecutor::Init()
   // 1. Build old/new record pairs.
   // 2. Validate the complete batch. NJUDB_STUDENT_TODO(l4, t2)
   // 3. Apply table and index updates atomically.
-  NJUDB_STUDENT_TODO(l2, t1);
+  is_end_ = false;
+  updates_to_perform_.clear();
+  auto *txn = context_ != nullptr ? context_->txn : nullptr;
+
+  child_->Init();
+  while (!child_->IsEnd()) {
+    auto old_record = child_->GetRecord();
+    auto values     = old_record->GetValues();
+    for (auto &[field, value] : updates_) {
+      const auto index = old_record->GetSchema()->GetRTFieldIndex(field);
+      NJUDB_ASSERT(index < old_record->GetSchema()->GetFieldCount(),
+          fmt::format("Unknown field in update: {}", field.field_.field_name_));
+      values[index] = value;
+    }
+    auto new_record = std::make_unique<Record>(old_record->GetSchema(), values, old_record->GetRID());
+    updates_to_perform_.emplace_back(std::move(old_record), std::move(new_record));
+    child_->Next();
+  }
+
+  int count = 0;
+  for (auto &[old_record, new_record] : updates_to_perform_) {
+    if (txn != nullptr && txn->GetProtocol() == ConcurrencyProtocol::MVCC) {
+      MVCCWriteCoordinator::Update(tbl_, indexes_, *old_record, *new_record, txn, context_->version_mgr_);
+    } else {
+      for (auto *index : indexes_) {
+        index->UpdateRecord(*old_record, *new_record);
+      }
+      tbl_->UpdateRecord(new_record->GetRID(), *new_record, txn);
+    }
+    ++count;
+  }
+
+  std::vector<ValueSptr> values{ValueFactory::CreateIntValue(count)};
+  record_ = std::make_unique<Record>(out_schema_.get(), values, INVALID_RID);
 }
 
 void UpdateExecutor::Next() { is_end_ = true; }
