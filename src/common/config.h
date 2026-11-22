@@ -21,6 +21,8 @@
 
 #ifndef NJUDB_CONFIG_H
 #define NJUDB_CONFIG_H
+#include <cstddef>
+#include <cstdint>
 #include <string>
 /// storage
 constexpr size_t  PAGE_SIZE        = 4096;
