@@ -31,27 +31,45 @@ NestedLoopJoinExecutor::NestedLoopJoinExecutor(
 /// inner join
 void NestedLoopJoinExecutor::InitInnerJoin()
 {
-  NJUDB_STUDENT_TODO(l2, f1);
-  NJUDB_STUDENT_TODO(l3, t1);
+  left_->Init();
+  right_->Init();
+  left_rec_ = nullptr;
+  record_   = nullptr;
+  if (left_->IsEnd()) {
+    return;
+  }
+  left_rec_ = left_->GetRecord();
+  NextInnerJoin();
 }
 
 void NestedLoopJoinExecutor::NextInnerJoin()
 {
-  NJUDB_STUDENT_TODO(l2, f1);
-  NJUDB_STUDENT_TODO(l3, t1);
+  while (!left_->IsEnd()) {
+    while (!right_->IsEnd()) {
+      auto joined = std::make_unique<Record>(out_schema_.get(), *left_rec_, *right_->GetRecord());
+      right_->Next();
+      if (ConditionExpr::Eval(conditions_, *joined)) {
+        record_ = std::move(joined);
+        return;
+      }
+    }
+    left_->Next();
+    if (left_->IsEnd()) {
+      break;
+    }
+    left_rec_ = left_->GetRecord();
+    right_->Init();
+  }
+  record_ = nullptr;
 }
 
-auto NestedLoopJoinExecutor::IsEndInnerJoin() const -> bool
-{
-  NJUDB_STUDENT_TODO(l2, f1);
-  NJUDB_STUDENT_TODO(l3, t1);
-}
+auto NestedLoopJoinExecutor::IsEndInnerJoin() const -> bool { return record_ == nullptr; }
 
 /// outer join
 void NestedLoopJoinExecutor::InitOuterJoin() { NJUDB_STUDENT_TODO(l3, t2); }
 
 void NestedLoopJoinExecutor::NextOuterJoin() { NJUDB_STUDENT_TODO(l3, t2); }
 
-auto NestedLoopJoinExecutor::IsEndOuterJoin() const -> bool { NJUDB_STUDENT_TODO(l3, t2); }
+auto NestedLoopJoinExecutor::IsEndOuterJoin() const -> bool { return NJUDB_STUDENT_TODO(l3, t2); }
 
 }  // namespace njudb
