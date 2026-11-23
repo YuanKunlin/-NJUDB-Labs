@@ -48,7 +48,7 @@ void UpdateExecutor::Init()
 {
   // Lab 02 may skip Lab 04's all-or-nothing unique-index validation.
   // 1. Build old/new record pairs.
-  // 2. Validate the complete batch. NJUDB_STUDENT_TODO(l4, t2)
+  // 2. Validate the complete batch（整批唯一性校验在下方循环里完成）
   // 3. Apply table and index updates atomically.
   is_end_ = false;
   updates_to_perform_.clear();
