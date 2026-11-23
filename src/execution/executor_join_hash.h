@@ -61,6 +61,8 @@ private:
   // Hash join specific methods
   void BuildHashTable();
   void StartProbing();
+  /// 定位当前左记录对应的候选右记录区间（哈希桶），并把匹配位置重置到区间头部
+  void LocateMatches();
   [[nodiscard]] auto ComputeHash(const Record &record, bool is_left_side) const -> size_t;
   [[nodiscard]] auto CheckJoinCondition(const Record &left_record, const Record &right_record) const -> bool;
 
