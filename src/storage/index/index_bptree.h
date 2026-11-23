@@ -213,6 +213,15 @@ private:
   void ClearPage(page_id_t page_id);
   auto CompareKeys(const Record &key1, const Record &key2) const -> int;
 
+  /// 文件头页（第 0 页）的读写守卫：root / tree_height / free list / page_num 都存在这里
+  auto FetchHeaderRead() -> ReadPageGuard;
+  auto FetchHeaderWrite() -> WritePageGuard;
+
+  // 初始化时从文件头缓存下来的节点容量，避免每次操作都去取头页
+  size_t key_size_{0};
+  size_t leaf_max_size_{0};
+  size_t internal_max_size_{0};
+
   // Constants
   static constexpr int LEAF_PAGE_SIZE     = PAGE_SIZE;
   static constexpr int INTERNAL_PAGE_SIZE = PAGE_SIZE;
