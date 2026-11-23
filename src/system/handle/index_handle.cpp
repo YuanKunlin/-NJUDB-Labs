@@ -21,8 +21,29 @@
 
 #include "index_handle.h"
 #include "../../../common/error.h"
+#include <unordered_set>
 
 namespace njudb {
+
+namespace {
+
+/// 把表记录投影成索引键记录
+auto ProjectKey(Index *index, const Record &record) -> Record
+{
+  return Record(index->GetKeySchema(), record);
+}
+
+/// 唯一索引不接受 NULL 键
+void EnsureNoNullKey(const Record &key, const std::string &index_name)
+{
+  for (size_t i = 0; i < key.GetSchema()->GetFieldCount(); ++i) {
+    if (key.GetValueAt(i)->IsNull()) {
+      NJUDB_THROW(NJUDB_INDEX_FAIL, fmt::format("NULL key is not allowed in index \"{}\"", index_name));
+    }
+  }
+}
+
+}  // namespace
 IndexHandle::IndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_pool_manager, table_id_t tid,
     idx_id_t iid, IndexType index_type, RecordSchemaUptr key_schema, std::string index_name)
     : table_id_(tid), index_(nullptr), index_name_(std::move(index_name)), key_schema_holder_(std::move(key_schema))
@@ -44,22 +65,58 @@ IndexHandle::IndexHandle(DiskManager *disk_manager, BufferPoolManager *buffer_po
 
 void IndexHandle::InsertRecord(const Record &rec)
 {
-  NJUDB_STUDENT_TODO(l4, t2);
+  std::lock_guard<std::mutex> lock(index_latch_);
+  if (index_ == nullptr) {
+    NJUDB_FATAL("Index not initialized");
+  }
+  auto key = ProjectKey(index_.get(), rec);
+  EnsureNoNullKey(key, index_name_);
+  // 唯一索引：已有相同键的记录就拒绝
+  if (!index_->Search(key).empty()) {
+    NJUDB_THROW(NJUDB_INDEX_FAIL, fmt::format("Insert would violate unique constraint on index {}", index_name_));
+  }
+  index_->Insert(key, rec.GetRID());
 }
 
 void IndexHandle::DeleteRecord(const Record &rec)
 {
-  NJUDB_STUDENT_TODO(l4, t2);
+  std::lock_guard<std::mutex> lock(index_latch_);
+  if (index_ == nullptr) {
+    NJUDB_FATAL("Index not initialized");
+  }
+  auto key = ProjectKey(index_.get(), rec);
+  index_->Delete(key);
 }
 
 void IndexHandle::UpdateRecord(const Record &old_rec, const Record &new_rec)
 {
-  NJUDB_STUDENT_TODO(l4, t2);
+  std::lock_guard<std::mutex> lock(index_latch_);
+  if (index_ == nullptr) {
+    NJUDB_FATAL("Index not initialized");
+  }
+  auto old_key = ProjectKey(index_.get(), old_rec);
+  auto new_key = ProjectKey(index_.get(), new_rec);
+  if (Record::Compare(old_key, new_key) == 0) {
+    return;  // 索引键没有变化，不需要维护
+  }
+  EnsureNoNullKey(new_key, index_name_);
+  // 键发生变化时，新键不能与其他记录冲突（自身 RID 除外）
+  for (const auto &rid : index_->Search(new_key)) {
+    if (rid != new_rec.GetRID()) {
+      NJUDB_THROW(NJUDB_INDEX_FAIL, fmt::format("Update would violate unique constraint on index {}", index_name_));
+    }
+  }
+  index_->Delete(old_key);
+  index_->Insert(new_key, new_rec.GetRID());
 }
 
 auto IndexHandle::SearchRange(const Record &low_key, const Record &high_key) -> std::vector<RID>
 {
-  NJUDB_STUDENT_TODO(l4, t2);
+  std::lock_guard<std::mutex> lock(index_latch_);
+  if (index_ == nullptr) {
+    NJUDB_FATAL("Index not initialized");
+  }
+  return index_->SearchRange(low_key, high_key);
 }
 
 auto IndexHandle::Search(const Record &key) -> std::vector<RID>
@@ -74,7 +131,12 @@ auto IndexHandle::Search(const Record &key) -> std::vector<RID>
 
 auto IndexHandle::CheckRecordExists(const Record &record) -> bool
 {
-  NJUDB_STUDENT_TODO(l4, t2);
+  std::lock_guard<std::mutex> lock(index_latch_);
+  if (index_ == nullptr) {
+    NJUDB_FATAL("Index not initialized");
+  }
+  auto key = ProjectKey(index_.get(), record);
+  return !index_->Search(key).empty();
 }
 
 auto IndexHandle::PrintIndexStats() -> std::string

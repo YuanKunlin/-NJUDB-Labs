@@ -25,6 +25,7 @@
 #include "concurrency/concurrency_protocol.h"
 #include "mvcc_write_coordinator.h"
 #include <fmt/format.h>
+#include <unordered_set>
 
 namespace njudb {
 
@@ -66,6 +67,34 @@ void UpdateExecutor::Init()
     auto new_record = std::make_unique<Record>(old_record->GetSchema(), values, old_record->GetRID());
     updates_to_perform_.emplace_back(std::move(old_record), std::move(new_record));
     child_->Next();
+  }
+
+  // Lab04：整个批次先做唯一索引校验，任何冲突都在第一次物理写入之前抛出
+  for (auto *index : indexes_) {
+    std::unordered_set<Record> batch_new_keys;
+    for (auto &[old_record, new_record] : updates_to_perform_) {
+      Record old_key(&index->GetKeySchema(), *old_record);
+      Record new_key(&index->GetKeySchema(), *new_record);
+      if (Record::Compare(old_key, new_key) == 0) {
+        continue;  // 索引键没变，不需要维护
+      }
+      for (size_t i = 0; i < new_key.GetSchema()->GetFieldCount(); ++i) {
+        if (new_key.GetValueAt(i)->IsNull()) {
+          NJUDB_THROW(NJUDB_INDEX_FAIL, fmt::format("NULL key is not allowed in index \"{}\"", index->GetIndexName()));
+        }
+      }
+      // 与已有索引项冲突（当前记录自身的 RID 要忽略）
+      for (const auto &rid : index->Search(new_key)) {
+        if (rid != new_record->GetRID()) {
+          NJUDB_THROW(NJUDB_INDEX_FAIL, fmt::format("Update would violate unique constraint on index {}", index->GetIndexName()));
+        }
+      }
+      // 本批次内部重复
+      if (!batch_new_keys.insert(std::move(new_key)).second) {
+        NJUDB_THROW(NJUDB_INDEX_FAIL,
+            fmt::format("Update would violate unique constraint on index {}", index->GetIndexName()));
+      }
+    }
   }
 
   int count = 0;

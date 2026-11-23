@@ -68,6 +68,8 @@ private:
   
   // Helper functions
   void GenerateRangeKeys();
+  /// 从 current_idx_ 开始找下一条「存在且满足谓词」的记录，找不到就把 current_idx_ 推到 end_idx_
+  void LoadNextVisibleRecord();
   auto GetRecordWithProtocol(const RID &rid) -> RecordUptr;
 };
 }  // namespace njudb

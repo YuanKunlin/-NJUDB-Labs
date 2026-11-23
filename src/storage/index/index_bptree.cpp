@@ -27,7 +27,7 @@
 #include <vector>
 #include <string>
 
-#define TEST_BPTREE
+// #define TEST_BPTREE  // gtest 已通过，用按页大小算出的真实节点容量
 
 namespace njudb {
 
@@ -40,7 +40,6 @@ auto AsLeaf(const char *data) -> const BPTreeLeafPage * { return reinterpret_cas
 auto AsInternal(char *data) -> BPTreeInternalPage * { return reinterpret_cast<BPTreeInternalPage *>(data); }
 auto AsInternal(const char *data) -> const BPTreeInternalPage * { return reinterpret_cast<const BPTreeInternalPage *>(data); }
 
-/// 由页内键字节构造一个只读键记录
 auto MakeKey(const char *key_data, const RecordSchema *schema) -> Record
 {
   return Record(schema, nullptr, key_data, INVALID_RID);
@@ -129,10 +128,8 @@ void BPTreePage::SetParentPageId(page_id_t parent_page_id) { parent_page_id_ = p
 auto BPTreePage::IsSafe(bool is_insert) const -> bool
 {
   if (is_insert) {
-    // 插入：还没满就安全
     return size_ < max_size_;
   }
-  // 删除：仍高于最小占用（ceil(max/2)）就安全；根节点的特殊规则由 AdjustRoot 处理
   return size_ >= (max_size_ + 1) / 2;
 }
 
@@ -249,7 +246,6 @@ void BPTreeLeafPage::MoveHalfTo(BPTreeLeafPage *recipient)
   }
   recipient->size_ = static_cast<size_t>(move);
   size_            = static_cast<size_t>(mid);
-  // 修复叶链：原页 -> 新右页 -> 原后继
   recipient->SetNextPageId(GetNextPageId());
   SetNextPageId(recipient->GetPageId());
 }
@@ -268,7 +264,7 @@ auto BPTreeLeafPage::RemoveAndDeleteRecord(const Record &key, const RecordSchema
 {
   const int pos = LowerBound(key, schema);
   if (pos >= GetSize() || CompareWithKey(KeyAt(pos), key, schema) != 0) {
-    return -1;  // 没找到
+    return -1;
   }
   for (int i = pos; i + 1 < GetSize(); ++i) {
     SetKeyAt(i, KeyAt(i + 1));
@@ -286,7 +282,6 @@ void BPTreeLeafPage::MoveAllTo(BPTreeLeafPage *recipient)
     recipient->SetValueAt(base + i, ValueAt(i));
   }
   recipient->size_ += size_;
-  // 被合并的右页从叶链上摘掉：左页直接指向右页的后继
   recipient->SetNextPageId(GetNextPageId());
   size_ = 0;
 }
@@ -326,7 +321,6 @@ void BPTreeInternalPage::SetValueAt(int index, page_id_t value)
 
 auto BPTreeInternalPage::Lookup(const Record &key, const RecordSchema *schema) const -> page_id_t
 {
-  // 最后一个满足 KeyAt(i) <= key 的子页（KeyAt(0) 是占位，不能用）
   int index = 0;
   for (int i = 1; i < GetSize(); ++i) {
     if (CompareWithKey(KeyAt(i), key, schema) <= 0) {
@@ -398,7 +392,6 @@ void BPTreeInternalPage::MoveHalfTo(BPTreeInternalPage *recipient, BufferPoolMan
     if (i > 0) {
       recipient->SetKeyAt(i, KeyAt(mid + i));
     }
-    // 被移动子页的父指针必须指向接收页
     auto child_guard = buffer_pool_manager->FetchPageWrite(index_id_, child);
     AsPage(PageContentPtr(child_guard.GetMutableData()))->SetParentPageId(recipient->GetPageId());
   }
@@ -500,7 +493,8 @@ void BPTreeIndex::InitializeIndex()
 
   size_t internal_header_size     = sizeof(BPTreeInternalPage);
   size_t available_internal_space = PAGE_SIZE - PAGE_HEADER_SIZE - internal_header_size;
-  header->internal_max_size_      = available_internal_space / (header->key_size_ + sizeof(page_id_t));
+  // 内部页需要 max+1 个子页指针和 max+1 个键槽（第 0 个是占位），所以要再减 1
+  header->internal_max_size_ = available_internal_space / (header->key_size_ + sizeof(page_id_t)) - 1;
 
   // check if the max size of leaf and internal are valid
   if (static_cast<int>(header->leaf_max_size_) <= 0 || static_cast<int>(header->internal_max_size_) <= 0) {
@@ -530,7 +524,6 @@ auto BPTreeIndex::NewPage() -> page_id_t
     auto header_guard = FetchHeaderWrite();
     auto header       = reinterpret_cast<BPTreeIndexHeader *>(header_guard.GetMutableData());
     if (header->first_free_page_id_ != INVALID_PAGE_ID) {
-      // 优先复用空闲链上的页
       page_id = header->first_free_page_id_;
       auto freed_guard = buffer_pool_manager_->FetchPageRead(index_id_, page_id);
       header->first_free_page_id_ = freed_guard.GetPage()->GetNextFreePageId();
@@ -539,7 +532,6 @@ auto BPTreeIndex::NewPage() -> page_id_t
       header->page_num_ += 1;
     }
   }
-  // 新页内容清零，避免复用空闲页时残留旧数据
   auto guard = buffer_pool_manager_->FetchPageWrite(index_id_, page_id);
   std::memset(PageContentPtr(guard.GetMutableData()), 0, PAGE_SIZE - PAGE_HEADER_SIZE);
   return page_id;
@@ -631,7 +623,6 @@ auto BPTreeIndex::InsertIntoLeaf(const Record &key, const RID &value) -> bool
     if (leaf_page->IsSafe(true)) {
       leaf_page->Insert(key, value, key_schema_);
     } else {
-      // 叶页已满：先分裂，再插入到合适的一侧
       new_leaf_page_id = NewPage();
       auto new_guard   = buffer_pool_manager_->FetchPageWrite(index_id_, new_leaf_page_id);
       auto new_page    = AsLeaf(PageContentPtr(new_guard.GetMutableData()));
@@ -639,7 +630,6 @@ auto BPTreeIndex::InsertIntoLeaf(const Record &key, const RID &value) -> bool
           static_cast<int>(leaf_max_size_));
       leaf_page->MoveHalfTo(new_page);
 
-      // 新页的最小键 <= key 时应该插到右页，否则插回左页
       if (CompareWithKey(new_page->KeyAt(0), key, key_schema_) <= 0) {
         new_page->Insert(key, value, key_schema_);
       } else {
@@ -673,7 +663,6 @@ void BPTreeIndex::InsertIntoParent(page_id_t old_node_id, const Record &key, pag
     auto parent_page  = AsInternal(PageContentPtr(parent_guard.GetMutableData()));
     parent_page->InsertNodeAfter(old_node_id, key, new_node_id);
     if (parent_page->GetSize() > parent_page->GetMaxSize()) {
-      // 内部页也满了：把后半部分切给新的内部页，中间键提升给父页
       const int mid = parent_page->GetSize() / 2;
       promoted_key  = std::make_unique<Record>(MakeKey(parent_page->KeyAt(mid), key_schema_));
       new_internal_page_id = NewPage();
@@ -788,7 +777,6 @@ auto BPTreeIndex::CoalesceOrRedistribute(page_id_t node_id) -> bool
     }
   }
   if (parent_page_id == INVALID_PAGE_ID) {
-    // 根节点：交给 AdjustRoot 单独处理，旧根页在让出守卫之后再回收
     bool reclaimed = false;
     {
       auto root_guard = buffer_pool_manager_->FetchPageWrite(index_id_, node_id);
@@ -817,7 +805,6 @@ auto BPTreeIndex::CoalesceOrRedistribute(page_id_t node_id) -> bool
   if (node_size + neighbor_size <= max_size) {
     return Coalesce(neighbor_id, node_id, parent_page_id, index);
   }
-  // 两页放不下：在兄弟之间搬一个条目
   auto node_guard     = buffer_pool_manager_->FetchPageWrite(index_id_, node_id);
   auto neighbor_guard = buffer_pool_manager_->FetchPageWrite(index_id_, neighbor_id);
   Redistribute(AsPage(PageContentPtr(neighbor_guard.GetMutableData())),
@@ -833,7 +820,6 @@ auto BPTreeIndex::Coalesce(page_id_t neighbor_node_id, page_id_t node_id, page_i
   const page_id_t right_id     = node_is_left ? neighbor_node_id : node_id;
   const int       right_index  = node_is_left ? 1 : index;
 
-  // 内部页合并时要把父页的中间键下移
   RecordUptr middle_key;
   {
     auto left_guard  = buffer_pool_manager_->FetchPageWrite(index_id_, left_id);
@@ -897,7 +883,6 @@ auto BPTreeIndex::Coalesce(page_id_t neighbor_node_id, page_id_t node_id, page_i
 
 void BPTreeIndex::Redistribute(BPTreePage *neighbor_node, BPTreePage *node, int index)
 {
-  // index 是 node 在父页中的位置；兄弟取相邻的一侧
   const bool node_is_left = (index == 0);
   auto      *left_page    = node_is_left ? node : neighbor_node;
   auto      *right_page   = node_is_left ? neighbor_node : node;
@@ -932,7 +917,6 @@ void BPTreeIndex::Redistribute(BPTreePage *neighbor_node, BPTreePage *node, int 
       keys.emplace_back(right_leaf->KeyAt(i), right_leaf->KeyAt(i) + key_size_);
       rids.push_back(right_leaf->ValueAt(i));
     }
-    // 重新写成 左 mid 条 + 右 total-mid 条
     left_leaf->SetSize(0);
     for (int i = 0; i < mid; ++i) {
       left_leaf->SetKeyAt(i, keys[i].data());
@@ -962,9 +946,6 @@ void BPTreeIndex::Redistribute(BPTreePage *neighbor_node, BPTreePage *node, int 
     for (int i = 0; i < left_internal->GetSize(); ++i) {
       children.push_back(left_internal->ValueAt(i));
       if (i == 0) {
-        // 左节点的最小键存在父页里；左节点是父页第一个子页时没有对应键
-        // 左节点是父页第一个子页时，它第一个子页的最小键在父页里没有独立存储；
-        // 这个占位值不会被写回父页（left_index == 0 时不会用到）
         const char *left_min_key =
             (left_index >= 1) ? parent_page->KeyAt(left_index) : parent_page->KeyAt(right_index);
         min_keys.emplace_back(left_min_key, left_min_key + key_size_);
@@ -998,7 +979,6 @@ void BPTreeIndex::Redistribute(BPTreePage *neighbor_node, BPTreePage *node, int 
     right_internal->size_ = static_cast<size_t>(total - mid);
     parent_page->SetKeyAt(right_index, min_keys[static_cast<size_t>(mid)].data());
 
-    // 子页父指针同步到新的两个父页
     for (int i = 0; i < total; ++i) {
       auto child_guard = buffer_pool_manager_->FetchPageWrite(index_id_, children[static_cast<size_t>(i)]);
       AsPage(PageContentPtr(child_guard.GetMutableData()))
@@ -1013,7 +993,6 @@ auto BPTreeIndex::AdjustRoot(BPTreePage *old_root_node) -> bool
     if (old_root_node->GetSize() > 0) {
       return false;
     }
-    // 根叶页被删空：整棵树变空
     auto header_guard     = FetchHeaderWrite();
     auto header           = reinterpret_cast<BPTreeIndexHeader *>(header_guard.GetMutableData());
     header->root_page_id_ = INVALID_PAGE_ID;
@@ -1031,7 +1010,6 @@ auto BPTreeIndex::AdjustRoot(BPTreePage *old_root_node) -> bool
     return true;
   }
   if (size == 1) {
-    // 内部根只剩一个子页：子页成为新根，树高减一
     const page_id_t child_page_id = root_page->ValueAt(0);
     {
       auto child_guard = buffer_pool_manager_->FetchPageWrite(index_id_, child_page_id);
@@ -1110,7 +1088,6 @@ void BPTreeIndex::BPTreeIterator::Next()
     ++index_;
     return;
   }
-  // 当前叶页读完：沿叶链走
   leaf_page_id_ = leaf_page->GetNextPageId();
   index_        = 0;
 }
@@ -1140,7 +1117,6 @@ auto BPTreeIndex::Begin() -> std::unique_ptr<IIterator>
   if (page_id == INVALID_PAGE_ID) {
     return End();
   }
-  // 沿最左子页一路下潜到叶页
   while (true) {
     auto        guard = buffer_pool_manager_->FetchPageRead(index_id_, page_id);
     const auto *page  = AsPage(PageContentPtr(guard.GetData()));

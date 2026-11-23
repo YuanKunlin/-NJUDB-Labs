@@ -25,6 +25,7 @@
 #include "concurrency/concurrency_protocol.h"
 #include "mvcc_write_coordinator.h"
 #include <fmt/format.h>
+#include <unordered_set>
 
 namespace njudb {
 
@@ -38,10 +39,28 @@ InsertExecutor::InsertExecutor(TableHandle *tbl, std::list<IndexHandle *> indexe
 
 void InsertExecutor::Init()
 {
-  // Lab 02 may skip the two Lab 04 uniqueness-validation steps.
-  // 1. Check existing index entries. NJUDB_STUDENT_TODO(l4, t2)
-  // 2. Check duplicate keys within this batch. NJUDB_STUDENT_TODO(l4, t2)
-  // 3. Apply table and index insertions atomically.
+  // Lab04：先完成唯一性校验，再执行任何物理写入，保证一批 INSERT 要么全成要么全失败
+  for (auto *index : indexes_) {
+    std::unordered_set<Record> batch_keys;
+    for (const auto &record : inserts_) {
+      Record key(&index->GetKeySchema(), *record);
+      for (size_t i = 0; i < key.GetSchema()->GetFieldCount(); ++i) {
+        if (key.GetValueAt(i)->IsNull()) {
+          NJUDB_THROW(NJUDB_INDEX_FAIL, fmt::format("NULL key is not allowed in index \"{}\"", index->GetIndexName()));
+        }
+      }
+      // 1. 与已有索引项冲突
+      if (index->CheckRecordExists(*record)) {
+        NJUDB_THROW(NJUDB_INDEX_FAIL, fmt::format("Insert would violate unique constraint on index {}", index->GetIndexName()));
+      }
+      // 2. 本批次内部重复
+      if (!batch_keys.insert(std::move(key)).second) {
+        NJUDB_THROW(NJUDB_INDEX_FAIL,
+            fmt::format("Insert would violate unique constraint on index {}", index->GetIndexName()));
+      }
+    }
+  }
+
   int  count = 0;
   auto *txn   = context_ != nullptr ? context_->txn : nullptr;
   is_end_     = false;
