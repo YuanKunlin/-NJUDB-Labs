@@ -50,6 +50,12 @@ private:
    */
   [[nodiscard]] auto Compare(const Record &left, const Record &right) const -> int;
 
+  /// 按 join_op_ 派发到等值/非等值实现（内连接与外连接共用，NULL 扩展行由 join_type_ 决定）
+  void InitJoin();
+  void NextJoin();
+  /// 为当前左记录填充等值连接的右记录缓冲（同一个连接键的一组右记录）
+  void FillEqualityBuffer();
+
   // Helper methods for inequality joins
   void InitInequalityJoinLessFamily();
   void InitInequalityJoinGreaterFamily();

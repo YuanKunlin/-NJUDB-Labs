@@ -31,17 +31,211 @@ SortMergeJoinExecutor::SortMergeJoinExecutor(JoinType join_type, AbstractExecuto
       join_op_(join_op)
 {}
 
-void SortMergeJoinExecutor::InitInnerJoin() { NJUDB_STUDENT_TODO(l3, f2); }
+auto SortMergeJoinExecutor::Compare(const Record &left, const Record &right) const -> int
+{
+  for (size_t i = 0; i < left_key_schema_->GetFieldCount(); ++i) {
+    auto left_index  = left.GetSchema()->GetRTFieldIndex(left_key_schema_->GetFieldAt(i));
+    auto right_index = right.GetSchema()->GetRTFieldIndex(right_key_schema_->GetFieldAt(i));
+    NJUDB_ASSERT(left_index != left.GetSchema()->GetFieldCount(), "Invalid left join key field");
+    NJUDB_ASSERT(right_index != right.GetSchema()->GetFieldCount(), "Invalid right join key field");
+    auto left_value  = left.GetValueAt(left_index);
+    auto right_value = right.GetValueAt(right_index);
+    if (left_value->IsNull() || right_value->IsNull()) {
+      if (left_value->IsNull() && right_value->IsNull()) {
+        continue;
+      }
+      return left_value->IsNull() ? -1 : 1;
+    }
+    ValueFactory::AlignTypes(left_value, right_value);
+    if (*left_value < *right_value) {
+      return -1;
+    }
+    if (*left_value > *right_value) {
+      return 1;
+    }
+  }
+  return 0;
+}
 
-void SortMergeJoinExecutor::NextInnerJoin() { NJUDB_STUDENT_TODO(l3, f2); }
+auto SortMergeJoinExecutor::EvaluateJoinCondition(const Record &left, const Record &right) const -> bool
+{
+  auto cmp = Compare(left, right);
+  switch (join_op_) {
+    case OP_EQ: return cmp == 0;
+    case OP_LT: return cmp < 0;
+    case OP_LE: return cmp <= 0;
+    case OP_GT: return cmp > 0;
+    case OP_GE: return cmp >= 0;
+    default: NJUDB_FATAL("Unsupported join operator for sort merge join");
+  }
+}
 
-auto SortMergeJoinExecutor::IsEndInnerJoin() const -> bool { NJUDB_STUDENT_TODO(l3, f2); }
+void SortMergeJoinExecutor::FillEqualityBuffer()
+{
+  right_buffer_.clear();
+  right_idx_ = 0;
+  while (!right_->IsEnd()) {
+    auto right_rec = right_->GetRecord();
+    auto cmp       = Compare(*left_rec_, *right_rec);
+    if (cmp > 0) {
+      right_->Next();
+      continue;
+    }
+    if (cmp < 0) {
+      break;
+    }
+    right_buffer_.push_back(std::make_shared<Record>(*right_rec));
+    right_->Next();
+  }
+}
 
-void SortMergeJoinExecutor::InitOuterJoin() { NJUDB_STUDENT_TODO(l3, f2); }
+void SortMergeJoinExecutor::InitJoin()
+{
+  switch (join_op_) {
+    case OP_EQ: InitEqualityJoin(); return;
+    case OP_LT:
+    case OP_LE: InitInequalityJoinLessFamily(); return;
+    case OP_GT:
+    case OP_GE: InitInequalityJoinGreaterFamily(); return;
+    default: NJUDB_FATAL("Unsupported join operator for sort merge join");
+  }
+}
 
-void SortMergeJoinExecutor::NextOuterJoin() { NJUDB_STUDENT_TODO(l3, f2); }
+void SortMergeJoinExecutor::NextJoin()
+{
+  switch (join_op_) {
+    case OP_EQ: NextEqualityJoin(); return;
+    case OP_LT:
+    case OP_LE: NextInequalityJoinLessFamily(); return;
+    case OP_GT:
+    case OP_GE: NextInequalityJoinGreaterFamily(); return;
+    default: NJUDB_FATAL("Unsupported join operator for sort merge join");
+  }
+}
 
-auto SortMergeJoinExecutor::IsEndOuterJoin() const -> bool { NJUDB_STUDENT_TODO(l3, f2); }
+void SortMergeJoinExecutor::InitEqualityJoin()
+{
+  left_->Init();
+  right_->Init();
+  left_rec_      = nullptr;
+  right_idx_     = 0;
+  need_gen_null_ = true;
+  record_        = nullptr;
+  right_buffer_.clear();
+  if (left_->IsEnd()) {
+    return;
+  }
+  left_rec_ = left_->GetRecord();
+  FillEqualityBuffer();
+  NextEqualityJoin(); 
+}
 
+void SortMergeJoinExecutor::NextEqualityJoin()
+{
+  while (left_rec_ != nullptr) {
+    if (right_idx_ < right_buffer_.size()) {
+      record_ = std::make_unique<Record>(out_schema_.get(), *left_rec_, *right_buffer_[right_idx_]);
+      ++right_idx_;
+      need_gen_null_ = false;
+      return;
+    }
+    bool       gen_null_row = join_type_ == OUTER_JOIN && right_buffer_.empty() && need_gen_null_;
+    RecordUptr null_row;
+    if (gen_null_row) {
+      Record null_right(right_->GetOutSchema());  // 所有字段为 NULL 的右表记录
+      null_row = std::make_unique<Record>(out_schema_.get(), *left_rec_, null_right);
+    }
+    left_->Next();
+    need_gen_null_ = true;
+    right_idx_     = 0;
+    if (left_->IsEnd()) {
+      left_rec_ = nullptr;
+    } else {
+      left_rec_ = left_->GetRecord();
+      if (right_buffer_.empty() || Compare(*left_rec_, *right_buffer_.front()) != 0) {
+        FillEqualityBuffer();
+      }
+    }
+    if (gen_null_row) {
+      record_ = std::move(null_row);
+      return;
+    }
+  }
+  record_ = nullptr;
+}
+
+void SortMergeJoinExecutor::InitInequalityJoinLessFamily()
+{
+  left_->Init();
+  right_->Init();
+  left_rec_      = nullptr;
+  right_idx_     = 0;
+  need_gen_null_ = true;
+  record_        = nullptr;
+  right_buffer_.clear();
+  if (left_->IsEnd()) {
+    return;
+  }
+  left_rec_ = left_->GetRecord();
+  while (!right_->IsEnd()) {
+    auto right_rec = right_->GetRecord();
+    if (!EvaluateJoinCondition(*left_rec_, *right_rec)) {
+      break;
+    }
+    right_buffer_.push_back(std::make_shared<Record>(*right_rec));
+    right_->Next();
+  }
+  NextInequalityJoinLessFamily();
+}
+
+void SortMergeJoinExecutor::NextInequalityJoinLessFamily()
+{
+  while (left_rec_ != nullptr) {
+    if (right_idx_ < right_buffer_.size()) {
+      record_ = std::make_unique<Record>(out_schema_.get(), *left_rec_, *right_buffer_[right_idx_]);
+      ++right_idx_;
+      need_gen_null_ = false;
+      return;
+    }
+    bool       gen_null_row = join_type_ == OUTER_JOIN && right_buffer_.empty() && need_gen_null_;
+    RecordUptr null_row;
+    if (gen_null_row) {
+      Record null_right(right_->GetOutSchema());
+      null_row = std::make_unique<Record>(out_schema_.get(), *left_rec_, null_right);
+    }
+    left_->Next();
+    need_gen_null_ = true;
+    right_idx_     = 0;
+    if (left_->IsEnd()) {
+      left_rec_ = nullptr;
+    } else {
+      left_rec_ = left_->GetRecord();
+      while (!right_buffer_.empty() && !EvaluateJoinCondition(*left_rec_, *right_buffer_.back())) {
+        right_buffer_.pop_back();
+      }
+    }
+    if (gen_null_row) {
+      record_ = std::move(null_row);
+      return;
+    }
+  }
+  record_ = nullptr;
+}
+
+void SortMergeJoinExecutor::InitInequalityJoinGreaterFamily() { InitInequalityJoinLessFamily(); }
+
+void SortMergeJoinExecutor::NextInequalityJoinGreaterFamily() { NextInequalityJoinLessFamily(); }
+
+void SortMergeJoinExecutor::InitInnerJoin() { InitJoin(); }
+
+void SortMergeJoinExecutor::NextInnerJoin() { NextJoin(); }
+
+auto SortMergeJoinExecutor::IsEndInnerJoin() const -> bool { return record_ == nullptr; }
+
+void SortMergeJoinExecutor::InitOuterJoin() { InitJoin(); }
+
+void SortMergeJoinExecutor::NextOuterJoin() { NextJoin(); }
+
+auto SortMergeJoinExecutor::IsEndOuterJoin() const -> bool { return record_ == nullptr; }
 
 }  // namespace njudb
